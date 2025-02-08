@@ -1,0 +1,111 @@
+services:
+  scandb:
+    container_name: scandb
+    image: postgres:17
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    restart: always
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/create_tables.sql
+    profiles:
+      - default
+
+  testdb:
+    container_name: testdb
+    image: postgres:17
+    environment:
+      - POSTGRES_USER=${TEST_POSTGRES_USER}
+      - POSTGRES_PASSWORD=${TEST_POSTGRES_PASSWORD}
+      - POSTGRES_DB=${TEST_POSTGRES_DB}
+    ports:
+      - "5433:5432"
+    restart: always
+    volumes:
+      - test_db_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/create_tables.sql
+    profiles:
+      - test
+
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:316.0.0-emulators
+    ports:
+      - "8085:8085"
+    entrypoint: gcloud beta emulators pubsub start --project test-project --host-port 0.0.0.0:8085
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://pubsub:8085"]
+      interval: 5s
+      timeout: 10s
+      retries: 3
+
+  # Creates a topic
+  mk-topic:
+    image: alpine/httpie
+    depends_on:
+      pubsub:
+        condition: service_healthy
+    command: PUT http://pubsub:8085/v1/projects/test-project/topics/scan-topic
+
+  # Creates a subscription
+  mk-subscription:
+    image: alpine/httpie
+    depends_on:
+      mk-topic:
+        condition: service_completed_successfully
+    command: PUT http://pubsub:8085/v1/projects/test-project/subscriptions/scan-sub topic=projects/test-project/topics/scan-topic --ignore-stdin 
+
+  scanner:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+      - PUBSUB_EMULATOR_HOST=${PUBSUB_EMULATOR_HOST}
+      - PUBSUB_PROJECT_ID=${PUBSUB_PROJECT_ID}
+    depends_on:
+      scandb:
+        condition: service_healthy
+      mk-topic:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    restart: always
+    profiles:
+      - default
+    volumes:
+      - ./src/mini_scan:/app/mini_scan 
+      - ./requirements.txt:/app/requirements.txt
+
+  test_runner:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    command: ["pytest", "test/"]
+    environment:
+      - POSTGRES_USER=${TEST_POSTGRES_USER}
+      - POSTGRES_PASSWORD=${TEST_POSTGRES_PASSWORD}
+      - POSTGRES_DB=${TEST_POSTGRES_DB}
+      - POSTGRES_HOST=${TEST_POSTGRES_HOST}
+      - POSTGRES_PORT=${TEST_POSTGRES_PORT}
+    depends_on:
+      - testdb
+    profiles:
+      - test
+    volumes:
+      - ./test-requirements.txt:/app/requirements.txt
+      - ./test:/app/test 
+      - ./src/mini_scan:/app/mini_scan 
+
+volumes:
+  db_data:
+    driver: local
+  test_db_data:
+    driver: local
